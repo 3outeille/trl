@@ -78,6 +78,7 @@ from trl.experimental.async_grpo.packing import (
     tree_ngram_shift_right,
     tree_ple_short_conv,
     tree_qsa_select_tokens,
+    unpad_tree,
 )
 from trl.experimental.async_grpo.weight_transfer import WeightTransferClient
 from trl.trainer.base_trainer import _BaseTrainer
@@ -1953,7 +1954,9 @@ class TestTreePackingParityQwen4Exp(TrlTestCase):
         model.set_attn_implementation("sdpa")
         model.gradient_checkpointing_enable()
         packed = _tree_row(self.SAMPLES).pack()
-        tree = _tree_function_kwargs(packed)
+        # The trainer hands the model `unpad_tree`'s view of the collated batch, on the device
+        tree_keys = [key for key in packed if key.startswith("tree_")]
+        tree = unpad_tree({key: packed[key].unsqueeze(0).to(torch_device) for key in tree_keys})
         input_ids = packed["input_ids"].to(torch_device)
         position_ids = packed["position_ids"].to(torch_device)  # the depth of each position on its own path
         weights = torch.randn(len(input_ids), generator=torch.Generator().manual_seed(1)).to(torch_device)
