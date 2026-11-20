@@ -266,7 +266,7 @@ def tree_maps(tree: dict[str, Any]) -> dict[str, torch.Tensor]:
 
     prev = torch.arange(n, device=device) - 1
     # A segment starts after its parent's last token, which is the parent segment's last position; a root starts a path
-    parent_last = torch.where(parents >= 0, cu_seqlens_q[(parents + 1).clamp_min(0)] - 1, -1)
+    parent_last = torch.where(parents >= 0, cu_seqlens_q.long()[(parents + 1).clamp_min(0)] - 1, -1)
     prev[cu_seqlens_q[:-1].long()] = parent_last
     segments = torch.repeat_interleave(torch.arange(len(lengths), device=device), torch.tensor(lengths, device=device))
     depth = (
@@ -277,7 +277,7 @@ def tree_maps(tree: dict[str, Any]) -> dict[str, torch.Tensor]:
     visible = torch.zeros(n, n, dtype=torch.bool, device=device)
     for start, end, path_start, path_end in zip(cu_q[:-1], cu_q[1:], cu_k[:-1], cu_k[1:], strict=True):
         # A path is laid out before the segment that follows it, so its positions are ascending
-        path = kv_index[path_start:path_end]
+        path = kv_index[path_start:path_end].long()
         visible[start:end, path] = path.unsqueeze(0) <= torch.arange(start, end, device=device).unsqueeze(1)
 
     entry = ((cu_seqlens_q, cu_seqlens_k, kv_index), {"prev": prev, "depth": depth, "visible": visible})

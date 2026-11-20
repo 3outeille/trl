@@ -71,6 +71,7 @@ from trl.experimental.async_grpo.async_rollout_worker import (
 from trl.experimental.async_grpo.packing import (
     TREE_ATTENTION,
     TreeRow,
+    patch_tree_gdn,
     patch_tree_qwen4_exp,
     tree_attn_implementation,
     tree_maps,
