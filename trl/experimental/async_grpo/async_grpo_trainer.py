@@ -38,7 +38,7 @@ from datasets import Dataset, IterableDataset
 from packaging.version import Version
 from torch.distributed._tensor import DTensor
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, TrainerCallback
+from transformers import AutoConfig, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, TrainerCallback
 from transformers.data.data_collator import DataCollatorMixin
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, SaveStrategy
 from transformers.utils import is_peft_available
@@ -60,7 +60,15 @@ from ...trainer.utils import (
 )
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutLoop, AsyncRolloutWorker, RolloutSample
-from .packing import TREE_ATTENTION, TreeRow, patch_tree_gdn, register_tree_attention, unpad_tree
+from .packing import (
+    TREE_ATTENTION,
+    TreeRow,
+    patch_tree_gdn,
+    patch_tree_qwen4_exp,
+    register_tree_attention,
+    tree_attn_implementation,
+    unpad_tree,
+)
 from .vllm_client import VLLMClient
 from .weight_transfer import WeightTransferClient
 
@@ -107,6 +115,16 @@ def _reduce_metric(key: str, values: list[MetricValue]) -> float:
     if "min" in words:
         return min(values)
     return sum(values) / len(values)
+
+
+def _broadcast_trainable_parameters(model) -> None:
+    """Start every rank from rank 0's trainable weights, for a model whose own load was rank-local."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    for parameter in model.parameters():
+        # A tensor-parallel shard is that rank's own piece of the weight, so there is nothing to make equal
+        if parameter.requires_grad and not isinstance(parameter, DTensor):
+            torch.distributed.broadcast(parameter.data, src=0)
 
 
 class _SupportsReset(Protocol):
@@ -987,15 +1005,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
             model_init_kwargs.setdefault("trust_remote_code", args.trust_remote_code)
             model_init_kwargs.setdefault("dtype", args.dtype)
             model_revision = model_init_kwargs.get("revision")
+            config = AutoConfig.from_pretrained(
+                model, revision=model_revision, trust_remote_code=args.trust_remote_code
+            )
             model = create_model_from_path(
                 model,
                 device_map=None,
-                attn_implementation=TREE_ATTENTION,
+                attn_implementation=tree_attn_implementation(config),
                 **model_init_kwargs,
             )
         else:
             model_revision = None
-            model.set_attn_implementation(TREE_ATTENTION)
+            model.set_attn_implementation(tree_attn_implementation(model.config))
             if args.model_init_kwargs is not None:
                 logger.warning(
                     "You passed `model_init_kwargs` to the `AsyncGRPOConfig`, but your model is already instantiated. "
@@ -1005,22 +1026,37 @@ class AsyncGRPOTrainer(_BaseTrainer):
         if args.use_liger_kernel:
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
 
+        # A model loaded sharded by transformers draws a different number of random numbers on every rank, so an
+        # adapter built on top of it starts apart per rank. Rank 0's is broadcast below, once the process group exists.
+        distributed_loading = getattr(model, "is_distributed_loading_by_transformers", False)
+
         text_config = model.config.get_text_config()
         layer_types = set(getattr(text_config, "layer_types", None) or []) - {"full_attention", "sliding_attention"}
         # Check tree attention compat
         if layer_types:
-            if layer_types == {"linear_attention"} and Version(transformers.__version__) < Version("5.15.0"):
+            if "linear_attention" in layer_types and Version(transformers.__version__) < Version("5.15.0"):
                 raise ValueError(
                     f"Tree packing of {type(model).__name__}'s gated DeltaNet layers requires transformers>=5.15.0: "
                     "before it, these layers call the functions they stored at init rather than the module-level "
                     "ones tree packing patches, so they would scan across samples."
                 )
-            if layer_types != {"linear_attention"} or not patch_tree_gdn(model):
+            if layer_types - {"linear_attention", "indexed_attention"} or not patch_tree_gdn(model):
                 raise ValueError(
                     f"{type(model).__name__} has {sorted(layer_types)} layers. Tree packing routes attention and "
                     "transformers' gated DeltaNet layers along each sample's own path; any other recurrent or "
                     "convolutional layer would scan across samples."
                 )
+            if layer_types == {"linear_attention", "indexed_attention"} and not patch_tree_qwen4_exp(model):
+                raise ValueError(
+                    f"{type(model).__name__} selects its sparse-attention keys, builds its n-gram embeddings and "
+                    "convolves its per-layer embeddings through module-level functions, and its modeling module lacks "
+                    "`qsa_select_tokens`, `ngram_shift_right` and `ple_short_conv`, so tree packing cannot reach them."
+                )
+        # Qwen4-Exp's indexer reads the 4D mask the model builds and selects its own keys on top of it. A flat
+        # all-ones mask keeps that mask plain causal: inferred from the tree's position ids, which are depths and not
+        # offsets, it would cut every path off from the segments before it.
+        self.explicit_attention_mask = tree_attn_implementation(model.config) != TREE_ATTENTION
+
         if any(name.endswith(".sinks") for name, _ in model.named_parameters()):
             raise ValueError(
                 f"{type(model).__name__} uses attention sinks, which the FA3 kernel used by tree packing does not "
@@ -1181,6 +1217,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             callbacks=callbacks,
             optimizers=optimizers,
         )
+
+        if peft_config is not None and distributed_loading:
+            _broadcast_trainable_parameters(self.model)
 
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
@@ -1447,6 +1486,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         forward_start = time.time()
         # MoE models: request router logits so the forward returns the load-balancing loss
         router_kwargs = {"output_router_logits": True} if self.aux_loss_enabled else {}
+        mask_kwargs = {"attention_mask": torch.ones_like(input_ids)} if self.explicit_attention_mask else {}
         outputs = model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1455,6 +1495,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
             score_ids=sampler_ids,
             fused_lm_head=True,
             **router_kwargs,
+            **mask_kwargs,
             **unpad_tree(inputs),
         )
         log_probs = outputs.log_probs.flatten()[token_index]

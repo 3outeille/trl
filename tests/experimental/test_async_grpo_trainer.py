@@ -68,7 +68,16 @@ from trl.experimental.async_grpo.async_rollout_worker import (
     _common_prefix_len,
     _spawn_stop_watcher,
 )
-from trl.experimental.async_grpo.packing import TREE_ATTENTION, TreeRow
+from trl.experimental.async_grpo.packing import (
+    TREE_ATTENTION,
+    TreeRow,
+    patch_tree_qwen4_exp,
+    tree_attn_implementation,
+    tree_maps,
+    tree_ngram_shift_right,
+    tree_ple_short_conv,
+    tree_qsa_select_tokens,
+)
 from trl.experimental.async_grpo.weight_transfer import WeightTransferClient
 from trl.trainer.base_trainer import _BaseTrainer
 
@@ -1709,6 +1718,254 @@ class TestTreePackingRefusesUnsupportedModels(TrlTestCase):
                 args=AsyncGRPOConfig(output_dir=self.tmp_dir, report_to="none"),
                 train_dataset=dataset,
             )
+
+
+def _tree_function_kwargs(packed):
+    return {
+        key: packed[key]
+        for key in ("tree_kv_index", "tree_cu_seqlens_q", "tree_cu_seqlens_k", "tree_segment_parents")
+    }
+
+
+def _segments(packed):
+    """Every segment of a packed row: its row positions, and the row positions of the path it follows."""
+    cu_seqlens_q, cu_seqlens_k = packed["tree_cu_seqlens_q"].tolist(), packed["tree_cu_seqlens_k"].tolist()
+    for q_start, q_end, k_start, k_end in zip(
+        cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_k[:-1], cu_seqlens_k[1:], strict=True
+    ):
+        yield q_start, q_end, packed["tree_kv_index"][k_start:k_end].tolist()
+
+
+class TestTreeMaps(TrlTestCase):
+    """The maps of a tree-packed row: what comes before each position on its own path, and what it sees."""
+
+    ROWS = [
+        _tree_sample([101, 102, 103, 201, 202], n_prompt=3),
+        _tree_sample([101, 102, 103, 301, 302], n_prompt=3),
+        _tree_sample([101, 102, 103, 201, 202, 401], n_prompt=3),
+        _tree_sample([500, 501], n_prompt=1),  # a second root
+    ]
+
+    def test_depth_is_the_row_position_ids(self):
+        packed = _tree_row(self.ROWS).pack()
+
+        maps = tree_maps(_tree_function_kwargs(packed))
+
+        assert maps["depth"].tolist() == packed["position_ids"].tolist()
+
+    def test_prev_is_the_position_before_on_the_same_path(self):
+        packed = _tree_row(self.ROWS).pack()
+
+        maps = tree_maps(_tree_function_kwargs(packed))
+
+        # 0-1 is the shared prompt, 4 and 5-6 fork off its 202, and 7-9 and 10-11 are other paths
+        assert packed["input_ids"].tolist() == [101, 102, 103, 201, 202, 202, 401, 103, 301, 302, 500, 501]
+        assert maps["prev"].tolist() == [-1, 0, 1, 1, 3, 3, 5, 1, 7, 8, -1, 10]
+
+    def test_each_position_sees_exactly_its_path_up_to_itself(self):
+        packed = _tree_row(self.ROWS).pack()
+
+        maps = tree_maps(_tree_function_kwargs(packed))
+
+        for q_start, q_end, path in _segments(packed):
+            width = q_end - q_start
+            expected = torch.arange(len(path)).unsqueeze(0) <= torch.arange(len(path) - width, len(path)).unsqueeze(1)
+            visible = maps["visible"][q_start:q_end]
+            torch.testing.assert_close(visible[:, path], expected)
+            assert visible.sum() == expected.sum()  # and nothing outside its own path
+
+    def test_maps_are_reused_within_a_forward(self):
+        packed = _tree_row(self.ROWS).pack()
+
+        assert tree_maps(_tree_function_kwargs(packed)) is tree_maps(_tree_function_kwargs(packed))
+
+
+class TestTreeQwen4ExpFunctions(TrlTestCase):
+    """The n-gram shift, the short convolution and the sparse selection must give a segment what its path gives alone."""
+
+    ROWS = TestTreeMaps.ROWS
+
+    def test_ngram_shift_matches_each_path_alone(self):
+        modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        packed = _tree_row(self.ROWS).pack()
+        tree = _tree_function_kwargs(packed)
+        context, eos = 2, 0
+        tokens = torch.tensor([[eos] * context + packed["input_ids"].tolist()])
+
+        for shift in (1, 2):
+            shifted = tree_ngram_shift_right(tokens, shift, eos, tree)
+
+            assert shifted.shape == tokens.shape
+            assert (shifted[:, :context] == eos).all()  # the caller's EOS context columns are kept
+            for q_start, q_end, path in _segments(packed):
+                alone = torch.tensor([[eos] * context + packed["input_ids"][path].tolist()])
+                expected = modeling.ngram_shift_right(alone, shift, eos)
+                packed_columns = shifted[:, context + q_start : context + q_end]
+                assert packed_columns.tolist() == expected[:, -(q_end - q_start) :].tolist()
+
+    def test_short_conv_matches_each_path_alone(self):
+        packed = _tree_row(self.ROWS).pack()
+        tree = _tree_function_kwargs(packed)
+        n, channels, kernel, dilation = len(packed["input_ids"]), 4, 3, 3
+        state_len = (kernel - 1) * dilation
+        torch.manual_seed(0)
+        conv1d = torch.nn.Conv1d(channels, channels, kernel_size=kernel, groups=channels, dilation=dilation, bias=True)
+        hidden_states = torch.randn(1, channels, n)
+
+        output = tree_ple_short_conv(torch.nn.functional.pad(hidden_states, (state_len, 0)), conv1d, tree)
+
+        assert output.shape == hidden_states.shape
+        for q_start, q_end, path in _segments(packed):
+            alone = torch.nn.functional.pad(hidden_states[..., path], (state_len, 0))
+            expected = torch.nn.functional.silu(conv1d(alone))[..., -(q_end - q_start) :]
+            torch.testing.assert_close(output[..., q_start:q_end], expected)
+
+    @pytest.mark.parametrize(("block_topk", "compress_ratio"), [(1, 2), (2, 4)])
+    def test_sparse_selection_matches_each_path_alone(self, block_topk, compress_ratio):
+        modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        packed = _tree_row(self.ROWS).pack()
+        tree = _tree_function_kwargs(packed)
+        n, heads, head_dim = len(packed["input_ids"]), 2, 8
+        torch.manual_seed(0)
+        q, raw_keys = torch.randn(1, n, heads, head_dim), torch.randn(1, n, head_dim)
+        angles = torch.arange(n).float().unsqueeze(-1) * 10000.0 ** (
+            -torch.arange(head_dim // 2).float() / (head_dim // 2)
+        )
+        cos = torch.cat([angles.cos()] * 2, dim=-1).unsqueeze(0)
+        sin = torch.cat([angles.sin()] * 2, dim=-1).unsqueeze(0)
+        norm = torch.nn.RMSNorm(head_dim)
+
+        selected = tree_qsa_select_tokens(q, raw_keys, cos, sin, norm, block_topk, compress_ratio, tree)
+
+        assert selected.shape == (1, 1, n, n)
+        assert selected.dtype == torch.bool
+        for q_start, q_end, path in _segments(packed):
+            width = q_end - q_start
+            causal = torch.tril(torch.ones(len(path), len(path), dtype=torch.bool)).view(1, 1, len(path), len(path))
+            expected = modeling.qsa_select_tokens(
+                q[:, path],
+                raw_keys[:, path],
+                cos[:, path],
+                sin[:, path],
+                causal,
+                norm,
+                block_topk,
+                compress_ratio,
+                block_topk * compress_ratio,
+            )
+            torch.testing.assert_close(selected[0, 0, q_start:q_end][:, path], expected[0, 0, len(path) - width :])
+            assert not selected[0, 0, q_start:q_end][:, [p for p in range(n) if p not in path]].any()
+
+
+class TestTreeQwen4ExpPatching(TrlTestCase):
+    def test_qwen4_exp_asks_for_its_own_mask(self):
+        pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        from transformers import Qwen4ExpConfig
+
+        assert tree_attn_implementation(Qwen4ExpConfig()) == "sdpa"
+        assert tree_attn_implementation(AutoConfig.for_model("llama")) == TREE_ATTENTION
+
+    def test_patch_needs_the_three_functions(self):
+        from transformers.models.llama import modeling_llama  # noqa: F401
+
+        class Stub:
+            pass
+
+        Stub.__module__ = "transformers.models.llama.modeling_llama"
+
+        assert not patch_tree_qwen4_exp(Stub())
+
+
+def _tiny_qwen4_exp_config():
+    return {
+        "vocab_size": 64,
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "max_position_embeddings": 64,
+        "layer_types": ["linear_attention", "indexed_attention"],
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "hc_count": 2,
+        "hc_lowrank": 8,
+        "ple_layer_ids": [1],
+        "ple_embed_dim": 16,
+        "ple_conv_kernel_size": 3,
+        "ngram_size": 3,
+        "heads_per_ngram": 2,
+        "ngram_vocab_size_base": 30,
+        "moe_intermediate_size": 16,
+        "shared_expert_intermediate_size": 16,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "indexer_n_heads": 2,
+        "indexer_kv_heads": 1,
+        "indexer_head_dim": 16,
+        "indexer_budget": 4,
+        "indexer_compress_ratio": 2,
+        "eos_token_id": 0,
+        "pad_token_id": 0,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+    }
+
+
+@require_torch_accelerator
+class TestTreePackingParityQwen4Exp(TrlTestCase):
+    """A tree-packed Qwen4-Exp row must give each of its paths the logits and gradients the path gives alone."""
+
+    SAMPLES = [
+        _tree_sample([1, 2, 3, 4, 5], n_prompt=3),
+        _tree_sample([1, 2, 3, 6, 7], n_prompt=3),
+        _tree_sample([1, 2, 3, 4, 5, 8, 9], n_prompt=3),
+        _tree_sample([11, 12], n_prompt=1),  # a second root
+    ]
+
+    def test_logits_and_grads_match_each_path_alone(self):
+        pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
+
+        torch.manual_seed(0)
+        model = Qwen4ExpForCausalLM(Qwen4ExpTextConfig(**_tiny_qwen4_exp_config())).to(torch_device)
+        assert patch_tree_gdn(model)
+        assert patch_tree_qwen4_exp(model)
+        model.set_attn_implementation("sdpa")
+        model.gradient_checkpointing_enable()
+        packed = _tree_row(self.SAMPLES).pack()
+        tree = _tree_function_kwargs(packed)
+        input_ids = packed["input_ids"].to(torch_device)
+        weights = torch.randn(len(input_ids), generator=torch.Generator().manual_seed(1)).to(torch_device)
+
+        def run(tokens, row_tree, row_weights):
+            """Weighted logits of one row, and the gradients they leave on the model."""
+            model.zero_grad()
+            logits = model(
+                input_ids=tokens.unsqueeze(0),
+                position_ids=torch.arange(len(tokens), device=tokens.device).unsqueeze(0),
+                attention_mask=torch.ones_like(tokens).unsqueeze(0),
+                **row_tree,
+            ).logits[0]
+            (logits.float() * row_weights.unsqueeze(-1)).sum().backward()
+            grads = {name: p.grad.float() for name, p in model.named_parameters() if p.grad is not None}
+            return logits.detach().float(), grads
+
+        logits, grads = run(input_ids, tree, weights)
+        alone_logits, alone_grads = [], {name: torch.zeros_like(p) for name, p in grads.items()}
+        for q_start, q_end, path in _segments(packed):
+            weights_path = torch.zeros(len(path), device=torch_device)
+            weights_path[-(q_end - q_start) :] = weights[q_start:q_end]
+            path_logits, path_grads = run(input_ids[path], {}, weights_path)
+            assert path_grads.keys() == grads.keys()
+            alone_logits.append(path_logits[-(q_end - q_start) :])
+            alone_grads = {name: alone_grads[name] + path_grads[name] for name in alone_grads}
+
+        torch.testing.assert_close(torch.cat(alone_logits), logits, atol=1e-4, rtol=1e-4)
+        alone_flat = torch.cat([alone_grads[name].flatten() for name in sorted(alone_grads)])
+        packed_flat = torch.cat([grads[name].flatten() for name in sorted(grads)])
+        assert (packed_flat - alone_flat).norm() < 1e-2 * alone_flat.norm()
 
 
 def _finalize(turns, rollout_id="r0"):
