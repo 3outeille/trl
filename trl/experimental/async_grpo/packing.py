@@ -430,7 +430,7 @@ def patch_tree_qwen4_exp(model) -> bool:
     Returns:
         `bool`: whether the model's modeling module has those functions.
     """
-    modeling = sys.modules[type(model).__module__]
+    modeling = sys.modules[type(model).forward.__module__]
     names = ("ngram_shift_right", "ple_short_conv", "qsa_select_tokens")
     originals = [vars(modeling).get(name) for name in names]
     if any(original is None for original in originals):
@@ -558,7 +558,7 @@ def patch_tree_gdn(model) -> bool:
     Returns:
         `bool`: whether the model's modeling module has those functions.
     """
-    modeling = sys.modules[type(model).__module__]
+    modeling = sys.modules[type(model).forward.__module__]
     conv, chunk = vars(modeling).get("causal_conv1d_fn"), vars(modeling).get("torch_chunk_gated_delta_rule")
     if conv is None or chunk is None:
         return False
