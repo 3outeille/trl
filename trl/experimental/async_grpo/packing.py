@@ -254,9 +254,11 @@ def tree_maps(tree: dict[str, Any]) -> dict[str, torch.Tensor]:
     if key in _TREE_MAPS:
         return _TREE_MAPS[key][1]
 
-    device, n = kv_index.device, kv_index.numel()
+    device = kv_index.device
     parents = tree["tree_segment_parents"].long()
     cu_q, cu_k = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
+    # Each segment's keys repeat its whole path, so the row has `cu_q[-1]` positions and `kv_index` is longer
+    n = cu_q[-1]
     segment_parents = parents.tolist()
     lengths = [end - start for start, end in zip(cu_q[:-1], cu_q[1:], strict=True)]
     # Parents are laid out before their children, so one pass gives every segment the depth its first token sits at
