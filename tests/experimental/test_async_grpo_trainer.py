@@ -1821,6 +1821,23 @@ class TestTreeQwen4ExpFunctions(TrlTestCase):
             expected = torch.nn.functional.silu(conv1d(alone))[..., -(q_end - q_start) :]
             torch.testing.assert_close(output[..., q_start:q_end], expected)
 
+    def test_ngram_shift_stops_at_an_eos_on_the_path(self):
+        modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        rows = [_tree_sample([5, 0, 6, 7], n_prompt=1), _tree_sample([5, 0, 8, 9], n_prompt=1)]
+        packed = _tree_row(rows).pack()
+        tree = _tree_function_kwargs(packed)
+        context, eos = 1, 0
+        tokens = torch.tensor([[eos] * context + packed["input_ids"].tolist()])
+
+        for shift in (1, 2, 3):
+            shifted = tree_ngram_shift_right(tokens, shift, eos, tree)
+
+            for q_start, q_end, path in _segments(packed):
+                alone = torch.tensor([[eos] * context + packed["input_ids"][path].tolist()])
+                expected = modeling.ngram_shift_right(alone, shift, eos)
+                packed_columns = shifted[:, context + q_start : context + q_end]
+                assert packed_columns.tolist() == expected[:, -(q_end - q_start) :].tolist()
+
     @pytest.mark.parametrize(("block_topk", "compress_ratio"), [(1, 2), (2, 4)])
     def test_sparse_selection_matches_each_path_alone(self, block_topk, compress_ratio):
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
@@ -1938,14 +1955,15 @@ class TestTreePackingParityQwen4Exp(TrlTestCase):
         packed = _tree_row(self.SAMPLES).pack()
         tree = _tree_function_kwargs(packed)
         input_ids = packed["input_ids"].to(torch_device)
+        position_ids = packed["position_ids"].to(torch_device)  # the depth of each position on its own path
         weights = torch.randn(len(input_ids), generator=torch.Generator().manual_seed(1)).to(torch_device)
 
-        def run(tokens, row_tree, row_weights):
+        def run(tokens, depths, row_tree, row_weights):
             """Weighted logits of one row, and the gradients they leave on the model."""
             model.zero_grad()
             logits = model(
                 input_ids=tokens.unsqueeze(0),
-                position_ids=torch.arange(len(tokens), device=tokens.device).unsqueeze(0),
+                position_ids=depths.unsqueeze(0),
                 attention_mask=torch.ones_like(tokens).unsqueeze(0),
                 **row_tree,
             ).logits[0]
@@ -1953,12 +1971,13 @@ class TestTreePackingParityQwen4Exp(TrlTestCase):
             grads = {name: p.grad.float() for name, p in model.named_parameters() if p.grad is not None}
             return logits.detach().float(), grads
 
-        logits, grads = run(input_ids, tree, weights)
+        logits, grads = run(input_ids, position_ids, tree, weights)
         alone_logits, alone_grads = [], {name: torch.zeros_like(p) for name, p in grads.items()}
         for q_start, q_end, path in _segments(packed):
             weights_path = torch.zeros(len(path), device=torch_device)
             weights_path[-(q_end - q_start) :] = weights[q_start:q_end]
-            path_logits, path_grads = run(input_ids[path], {}, weights_path)
+            depths = torch.arange(len(path), device=torch_device)
+            path_logits, path_grads = run(input_ids[path], depths, {}, weights_path)
             assert path_grads.keys() == grads.keys()
             alone_logits.append(path_logits[-(q_end - q_start) :])
             alone_grads = {name: alone_grads[name] + path_grads[name] for name in alone_grads}
