@@ -1261,7 +1261,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         if self.dp_size != num_processes:
             logger.info(
                 f"Data-parallel layout: {self.dp_size} replica(s) across {num_processes} processes; this process is "
-                f"replica {self.dp_index} and reads row {self.row_of_rank[self.dp_index]} of each micro-batch."
+                f"replica {self.dp_index} and reads row {self.dp_index} of each micro-batch."
             )
 
         # Add tags to the model
