@@ -1949,12 +1949,10 @@ class TestTreeQwen4ExpPatching(TrlTestCase):
         assert tree_attn_implementation(AutoConfig.for_model("llama")) == TREE_ATTENTION
 
     def test_patch_needs_the_three_functions(self):
-        from transformers.models.llama import modeling_llama  # noqa: F401
+        from transformers.models.llama import modeling_llama
 
         class Stub:
-            pass
-
-        Stub.__module__ = "transformers.models.llama.modeling_llama"
+            forward = modeling_llama.LlamaModel.forward
 
         assert not patch_tree_qwen4_exp(Stub())
 
