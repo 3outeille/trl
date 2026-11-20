@@ -51,6 +51,8 @@ from trl.experimental.async_grpo.async_grpo_trainer import (
     TokenBudgetBatcher,
     _iter_vllm_named_params,
     _reduce_metric,
+    data_parallel_layout,
+    per_rank_token_count,
     round_lora_rank,
     save_lora_adapter,
     select_adapter_sync,
@@ -1223,6 +1225,36 @@ def _row_tokens(group: list[dict]) -> int:
     return sum(len(sample["input_ids"]) for sample in group)
 
 
+class TestDataParallelLayout(TrlTestCase):
+    """Which processes hold different rows: one replica spans its tensor-, expert- and pipeline-parallel ranks."""
+
+    @staticmethod
+    def _model(tp_size: int | None = None, fsdp_size: int | None = None):
+        config = SimpleNamespace()
+        if tp_size is not None:
+            config.distributed_config = SimpleNamespace(tp_size=tp_size, fsdp_size=fsdp_size, pp_size=1, ep_size=1)
+        return SimpleNamespace(config=config)
+
+    def test_without_a_distributed_config_every_process_is_a_replica(self):
+        model = self._model()
+
+        assert [data_parallel_layout(model, 4, rank) for rank in range(4)] == [(4, 0), (4, 1), (4, 2), (4, 3)]
+
+    def test_a_replica_spans_its_tensor_parallel_ranks(self):
+        model = self._model(tp_size=4, fsdp_size=1)
+
+        assert [data_parallel_layout(model, 4, rank) for rank in range(4)] == [(1, 0)] * 4
+
+    def test_fsdp_ranks_hold_different_replicas(self):
+        model = self._model(tp_size=2, fsdp_size=2)
+
+        assert [data_parallel_layout(model, 4, rank) for rank in range(4)] == [(2, 0), (2, 0), (2, 1), (2, 1)]
+
+    def test_the_loss_is_normalized_by_one_replicas_share_of_the_tokens(self):
+        assert per_rank_token_count(torch.tensor(100.0), 4).item() == 25.0
+        assert per_rank_token_count(torch.tensor(0.0), 4).item() == 1.0  # an empty step still divides by something
+
+
 class TestPackingAwareBatching(TrlTestCase):
     """Packing-aware dynamic batching is pure scheduling/tensorization, so these run without a GPU."""
 
@@ -1344,6 +1376,37 @@ class TestPackingAwareBatching(TrlTestCase):
         assert collator.metrics["reward"] == [0.5]  # (0.5 + 0.25 + 0.75 + 0.5) / 4
         assert collator.metrics["batch/samples_per_row"] == [2.0]
         assert collator.metrics["batch/pad_frac"] == [(0, 10)]  # rows pack equal -> no inter-rank padding
+
+    def test_a_replicas_ranks_get_the_same_row(self):
+        high, low, long = _rollout_sample(3, advantage=1.0), _rollout_sample(2, advantage=-1.0), _rollout_sample(4)
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=4, row_of_rank=[0, 0, 1, 1])
+        batch = collator([[_tree_row([high, low]), _tree_row([long])]])
+
+        assert batch["input_ids"].shape[0] == 4
+        assert batch["input_ids"][0].tolist() == batch["input_ids"][1].tolist()
+        assert batch["input_ids"][2].tolist() == batch["input_ids"][3].tolist()
+        assert batch["input_ids"][0].tolist() != batch["input_ids"][2].tolist()
+        # A row a replica repeats is counted once in the step's counts
+        trained = sum(int(sample["completion_mask"].sum()) for sample in (high, low, long))
+        assert batch["global_n_tokens"].tolist() == [float(trained)] * 4
+        assert batch["global_n_forward_tokens"].tolist() == [3.0 + 2.0 + 4.0] * 4
+
+    def test_a_single_replica_reads_one_row_everywhere(self):
+        samples = [_rollout_sample(3, advantage=1.0), _rollout_sample(2, advantage=-1.0)]
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=4, row_of_rank=[0, 0, 0, 0])
+        batch = collator([[_tree_row(samples)]])
+
+        assert all(row == batch["input_ids"][0].tolist() for row in batch["input_ids"].tolist())
+        trained = sum(int(sample["completion_mask"].sum()) for sample in samples)
+        assert batch["global_n_tokens"].tolist() == [float(trained)] * 4
+
+    def test_the_planner_opens_one_row_per_replica(self):
+        batcher = TokenBudgetBatcher(
+            (_rollout_sample(2) for _ in range(20)), num_processes=1, token_budget=8, metrics=defaultdict(list)
+        )
+
+        micro_batch = next(_micro_batches(batcher))
+        assert len(micro_batch) == 1  # one row, however many samples fit in it
 
     def test_collator_handles_a_ragged_metric_key_set(self):
         # A micro-batch mixes samples that carry `tools/*` with samples that do not. Both orderings matter: a first

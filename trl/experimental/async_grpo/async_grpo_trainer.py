@@ -117,6 +117,27 @@ def _reduce_metric(key: str, values: list[MetricValue]) -> float:
     return sum(values) / len(values)
 
 
+def data_parallel_layout(model, num_processes: int, rank: int) -> tuple[int, int]:
+    """
+    How many data-parallel replicas this run trains, and which of them a process holds.
+
+    A model loaded with a `DistributedConfig` spreads one replica over its tensor-, expert- and pipeline-parallel
+    ranks, which all compute the same tokens: only its FSDP ranks hold different rows, so `dp_size` is `fsdp_size`.
+    The dense mesh comes from `torch.arange(world_size).view(pp_size, fsdp_size, tp_size)`, so a replica's ranks are
+    consecutive in blocks of `tp_size` — row-major, which is what maps a rank to its replica. Without a
+    `DistributedConfig` every process is its own replica.
+    """
+    distributed_config = getattr(getattr(model, "config", None), "distributed_config", None)
+    if distributed_config is None:
+        return num_processes, rank
+    return distributed_config.fsdp_size, rank // distributed_config.tp_size % distributed_config.fsdp_size
+
+
+def per_rank_token_count(global_n_tokens: torch.Tensor, dp_size: int) -> torch.Tensor:
+    """The step's trained tokens one data-parallel replica is responsible for, which the loss is normalized by."""
+    return (global_n_tokens / dp_size).clamp(min=1.0).to(torch.float32)
+
+
 def _broadcast_trainable_parameters(model) -> None:
     """Start every rank from rank 0's trainable weights, for a model whose own load was rank-local."""
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -474,27 +495,31 @@ class _EmptyIterableDataset(torch.utils.data.IterableDataset):
 @dataclass
 class DataCollatorForRollout(DataCollatorMixin):
     """
-    Padding-free collator (the packer) for rollout samples. Packs a micro-batch into `num_processes` rows (one per DP
-    rank) and, for each row, the flat list of loss terms taken over it: which packed position predicts which target,
-    with what old log-probability, advantage and originating completion. Rows are padded only to the longest row, so
-    the batch stays rectangular for `DataLoaderDispatcher` to scatter row `i` -> rank `i`; this inter-rank padding is
-    stripped per-rank in `compute_loss`.
+    Padding-free collator (the packer) for rollout samples. Packs a micro-batch into `num_processes` rows (one per
+    process) and, for each row, the flat list of loss terms taken over it: which packed position predicts which
+    target, with what old log-probability, advantage and originating completion. Rows are padded only to the longest
+    row, so the batch stays rectangular for `DataLoaderDispatcher` to scatter row `i` -> rank `i`; this inter-rank
+    padding is stripped per-rank in `compute_loss`.
 
     Each row is a [`~packing.TreeRow`], so a token shared by several of its samples is forwarded once.
 
-    The micro-batch arrives already partitioned into `num_processes` rows by the upstream planner
+    The micro-batch arrives already partitioned into data-parallel rows by the upstream planner
     ([`TokenBudgetBatcher`]) — which balances each row's attention cost to avoid stragglers at the gradient all-reduce
-    — so the collator only packs and tensorizes the given rows.
+    — so the collator only packs and tensorizes them. Under tensor, expert or pipeline parallelism one replica spans
+    several processes, which must all read the same row: `row_of_rank` says which of the planner's rows each process
+    gets, and the batch repeats a row across its replica's ranks.
 
     Args:
         pad_token_id (`int`):
             Token id used to pad `input_ids`.
         num_processes (`int`, *optional*, defaults to `1`):
-            Number of DP ranks; the micro-batch is packed into this many rows.
+            Number of processes; the batch holds this many rows, one per process.
         metrics (`dict[str, list]`, *optional*):
             The trainer's metric sink, appended to with this micro-batch's sample and packing metrics.
         token_budget (`int`, *optional*, defaults to `0`):
             Per-row token cap of the planner, or `0` when batching by fixed sample count.
+        row_of_rank (`list[int]`, *optional*):
+            Index of the planner row each process reads, or `None` when every process is its own replica.
     """
 
     pad_token_id: int
@@ -505,13 +530,16 @@ class DataCollatorForRollout(DataCollatorMixin):
     # The trainer's metric sink, shared by reference (like `groups_trained`).
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     token_budget: int = 0
+    row_of_rank: list[int] | None = None
 
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
-        # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
-        # rows, so `examples` is a length-1 list holding that single micro-batch (one row per rank).
+        # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into one row per
+        # data-parallel replica, so `examples` is a length-1 list holding that single micro-batch.
         (rows,) = examples
 
-        packed = [row.pack() for row in rows]
+        packed_rows = [row.pack() for row in rows]
+        row_of_rank = self.row_of_rank or range(len(rows))
+        packed = [packed_rows[index] for index in row_of_rank]
         padding = {
             "input_ids": self.pad_token_id,
             "shift_labels": -100,
@@ -526,9 +554,10 @@ class DataCollatorForRollout(DataCollatorMixin):
         all_examples = [example for row in rows for example in row.samples]
         self.groups_trained.update(example["group_id"] for example in all_examples)
 
-        # Repeated per rank so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0
-        n_trained_tokens = sum(p["token_index"].numel() for p in packed)
-        n_forward_tokens = sum(p["input_ids"].numel() for p in packed)
+        # Repeated per rank so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0, and counted
+        # over the planner's rows so a row a replica repeats is counted once.
+        n_trained_tokens = sum(p["token_index"].numel() for p in packed_rows)
+        n_forward_tokens = sum(p["input_ids"].numel() for p in packed_rows)
         batch["global_n_tokens"] = torch.full((self.num_processes,), float(n_trained_tokens))
         batch["global_n_forward_tokens"] = torch.full((self.num_processes,), float(n_forward_tokens))
         batch["mean_seq_len"] = torch.full((self.num_processes,), n_forward_tokens / len(all_examples))
@@ -1221,6 +1250,20 @@ class AsyncGRPOTrainer(_BaseTrainer):
         if peft_config is not None and distributed_loading:
             _broadcast_trainable_parameters(self.model)
 
+        # A replica's tensor-, expert- and pipeline-parallel ranks compute the same tokens, so only `dp_size` rows are
+        # packed per micro-batch and every process reads the row of the replica it belongs to, repeated across its
+        # group: `row_of_rank[accelerator.process_index]` is the planner row that process trains on.
+        num_processes = self.accelerator.num_processes
+        self.dp_size, self.dp_index = data_parallel_layout(self.model, num_processes, self.accelerator.process_index)
+        self.row_of_rank = [
+            data_parallel_layout(self.model, num_processes, rank)[1] for rank in range(num_processes)
+        ]
+        if self.dp_size != num_processes:
+            logger.info(
+                f"Data-parallel layout: {self.dp_size} replica(s) across {num_processes} processes; this process is "
+                f"replica {self.dp_index} and reads row {self.row_of_rank[self.dp_index]} of each micro-batch."
+            )
+
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
 
@@ -1240,9 +1283,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self._groups_before_resume = 0
         self._epoch_stop_groups: int | None = None
         samples_per_step = (
-            self.args.per_device_train_batch_size
-            * self.args.gradient_accumulation_steps
-            * self.accelerator.num_processes
+            self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps * self.dp_size
         )
         if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
             # Fork-independent stop: num_train_epochs full passes over the prompts.
@@ -1403,17 +1444,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self._rollout_dataset.lookahead_tokens = (
                 max(self.args.max_staleness, 1)
                 * self.args.gradient_accumulation_steps
-                * num_processes
+                * self.dp_size
                 * self.args.token_budget
             )
             self.rollout_worker.token_allowance.value = self._rollout_dataset.lookahead_tokens
-            dataset = TokenBudgetBatcher(dataset, num_processes, self.args.token_budget, self._metrics["train"])
+            # One row per data-parallel replica: a replica's parallel ranks get the same row from the collator below.
+            dataset = TokenBudgetBatcher(dataset, self.dp_size, self.args.token_budget, self._metrics["train"])
         else:
             dataset = _EmptyIterableDataset()
 
-        # Each planner item is one complete micro-batch (`num_processes` pre-packed rows), so the dataloader pulls them
-        # one at a time (batch_size=1) and the collator tensorizes each into a rectangular `(num_processes, T_max)`
-        # batch that DataLoaderDispatcher scatters row `i` -> rank `i`.
+        # Each planner item is one complete micro-batch (`dp_size` pre-packed rows), so the dataloader pulls them one
+        # at a time (batch_size=1) and the collator tensorizes each into a rectangular `(num_processes, T_max)` batch,
+        # one row per process, that DataLoaderDispatcher scatters row `i` -> rank `i`.
         return self.accelerator.prepare(
             DataLoader(
                 dataset,
@@ -1426,6 +1468,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
                     # construct the collator (and never use it) while `token_budget` is still `None`.
                     token_budget=self.args.token_budget or 0,
+                    row_of_rank=self.row_of_rank,
                 ),
                 num_workers=0,
             )
@@ -1526,13 +1569,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
             per_token_loss2 = coef_2 * advantages
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2) * ~is_masked
 
-        # DDP/FSDP averages gradients across ranks (world_size). To get correct per-token normalization we scale by
-        # 1/tokens_per_rank = world_size / global_n_tokens, so after DDP averaging the effective scale is 1/global_n_tokens.
+        # The replicas' gradients are averaged — by accelerate's DDP wrapper, by FSDP2's reduce-scatter, and for the
+        # replicated PEFT parameters by transformers' `_sync_replicated_trainable_parameters` over every rank — so
+        # scaling each rank by its replica's share of the step's tokens makes the averaged gradient the gradient of the
+        # mean over the step's trained tokens.
         loss = per_token_loss.sum()
         global_n_tokens = inputs["global_n_tokens"][0]
-        world_size = self.accelerator.num_processes
-        tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
-        loss = loss / tokens_per_rank.to(torch.float32)
+        loss = loss / per_rank_token_count(global_n_tokens, self.dp_size)
         loss = loss / self.current_gradient_accumulation_steps
 
         # The policy loss above is scaled for gradient accumulation (HF auto-scaling is off here), so scale aux too
@@ -1621,8 +1664,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self._metrics["train"]["clip_ratio/high_max"].append(nanmax(gathered_high_max).item())
 
             if self.aux_loss_enabled:
+                # A mean per row, so averaging over the ranks that hold them is the batch's auxiliary loss
                 gathered_aux = self.accelerator.reduce(aux_loss.detach().to(torch.float32), reduction="sum")
-                self._metrics["train"]["aux_loss"].append((gathered_aux / world_size).item())
+                self._metrics["train"]["aux_loss"].append((gathered_aux / self.accelerator.num_processes).item())
 
         # Per-step accounting, accumulated across the micro-batches of one optimizer step and flushed in
         # `training_step`. The counts are batch-wide (the collator broadcasts one value per rank), so they are read off
