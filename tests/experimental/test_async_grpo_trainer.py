@@ -1760,9 +1760,10 @@ class TestTreeMaps(TrlTestCase):
 
         maps = tree_maps(_tree_function_kwargs(packed))
 
-        # 0-1 is the shared prompt, 4 and 5-6 fork off its 202, and 7-9 and 10-11 are other paths
+        # A trie node is a token and the one after it, so the shared prompt 0-1 forks before 103: 2-3 continues into 4
+        # and 5-6, 7-9 is the other branch, and 10-11 is another root
         assert packed["input_ids"].tolist() == [101, 102, 103, 201, 202, 202, 401, 103, 301, 302, 500, 501]
-        assert maps["prev"].tolist() == [-1, 0, 1, 1, 3, 3, 5, 1, 7, 8, -1, 10]
+        assert maps["prev"].tolist() == [-1, 0, 1, 2, 3, 3, 5, 1, 7, 8, -1, 10]
 
     def test_each_position_sees_exactly_its_path_up_to_itself(self):
         packed = _tree_row(self.ROWS).pack()
