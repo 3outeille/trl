@@ -1724,13 +1724,20 @@ def _tree_kwargs(packed):
 
 class TestTreeQwen4Exp(TrlTestCase):
     """
-    On a tree-packed row, the n-gram shift and the short convolution must give every token what it gets when its sample
-    runs alone. The four samples below pack into one row (0 is EOS):
+    AsyncGRPO packs several samples into one row as a tree: the tokens that samples have in common at the start are
+    stored once, and each sample continues on its own branch. The n-gram shift and the short convolution read earlier
+    tokens, so on such a row they must read the earlier tokens of the token's own sample, not its neighbours in the row.
+    These tests check that every token gets what it gets when its sample runs alone.
+
+    The four samples below (0 is EOS) pack into this row:
 
         position  0    1    2    3    4    5    6    7    8    9    10   11   12
         token     101  102  103  201  202  202  401  103  301  302  500  0    501
+        sample    ABC  ABC  AC   AC   A    C    C    B    B    B    D    D    D
 
-    A token is shared only if the next token is shared too, so 103 and 202 appear twice.
+    Each position's output predicts the next token, so samples share a position only if they also have the same next
+    token. That is why 103 appears twice (next is 201 in A and C, 301 in B), and 202 too (A ends there, C continues
+    with 401). `PATHS` lists each sample's positions in order.
     """
 
     SAMPLES = [
