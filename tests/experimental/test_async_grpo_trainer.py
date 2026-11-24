@@ -1804,26 +1804,39 @@ class TestTreeQwen4Exp(TrlTestCase):
             torch.testing.assert_close(output[..., path], alone)
 
     def test_visible_and_depth_follow_each_sample(self):
+        """Along each sample, `depth` counts 0, 1, 2, ... and `visible` is causal, with nothing outside the sample."""
         packed = _tree_row(self.SAMPLES).pack()
 
         maps = tree_maps(_tree_kwargs(packed))
 
-        assert maps["depth"].tolist() == packed["position_ids"].tolist()
         for path in self.PATHS:
             causal = torch.ones(len(path), len(path), dtype=torch.bool).tril()
+            assert maps["depth"][path].tolist() == list(range(len(path)))
             assert maps["visible"][path][:, path].tolist() == causal.tolist()
             assert maps["visible"][path].sum() == causal.sum()  # and nothing outside the sample
 
     @pytest.mark.parametrize(("block_topk", "compress_ratio"), [(1, 2), (2, 4), (1, 8)])  # 8: no full block at all
     def test_sparse_selection_matches_each_sample_alone(self, block_topk, compress_ratio):
+        """
+        Each query keeps its `block_topk` best blocks of `compress_ratio` tokens in its own sample, plus the tokens after
+        its last full block. With `compress_ratio=2` and the row of the class docstring, the last token of each sample
+        chooses among:
+
+            A:  (0 1)  (2 3)  + 4
+            B:  (0 1)  (7 8)  + 9
+            C:  (0 1)  (2 3)  (5 6)
+            D:  (10 11)       + 12
+
+        Block (0 1) is in A, B and C, so it is pooled and scored once.
+        """
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
         model_select = modeling.Qwen4ExpTextQSAIndexer._select_tokens
         packed = _tree_row(self.SAMPLES).pack()
         n, heads, head_dim = len(packed["input_ids"]), 2, 8
         torch.manual_seed(0)
         q, raw_keys = torch.randn(1, n, heads, head_dim), torch.randn(1, n, head_dim)
-        angles = torch.randn(1, n, head_dim)  # any rotary angles do: both sides read the same ones per position
-        cos, sin, norm = angles.cos(), angles.sin(), torch.nn.RMSNorm(head_dim)
+        cos, sin = torch.randn(2, 1, n, head_dim)  # any values: both sides read the same ones per position
+        norm = torch.nn.RMSNorm(head_dim)
         indexer = SimpleNamespace(  # the model's selection only reads these from its layer
             k_layernorm=norm,
             block_topk=block_topk,
