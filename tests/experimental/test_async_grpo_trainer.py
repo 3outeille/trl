@@ -1761,12 +1761,8 @@ class TestTreeQwen4Exp(TrlTestCase):
 
     def test_ngram_shift_matches_each_sample_alone(self):
         """
-        Each token becomes the token `shift` steps back in its own sample, or EOS (0) at the start or past an EOS:
-
-            position  0    1    2    3    4    5    6    7    8    9    10   11   12
-            token     101  102  103  201  202  202  401  103  301  302  500  0    501
-            shift 1   0    101  102  103  201  201  202  102  103  301  0    500  0
-            shift 2   0    0    101  102  103  103  201  101  102  103  0    0    0
+        Each token becomes the token `shift` steps back in its own sample, or EOS (0) at the start or past an EOS. With
+        the row of the class docstring:
 
             shift 1, position 5 (C):   5 → 3 = 201     not 4 = 202 (A)
             shift 1, position 7 (B):   7 → 1 = 102     not 6 = 401 (C)
@@ -1787,7 +1783,7 @@ class TestTreeQwen4Exp(TrlTestCase):
     def test_short_conv_matches_each_sample_alone(self):
         """
         With 3 taps and dilation 2, each position reads itself and the positions 2 and 4 steps back in its own sample,
-        or zeros before the start of the sample:
+        or zeros before the start of the sample. With the row of the class docstring:
 
             position 6 (C):   6 → 3 → 1       not 6 → 4 → 2 (4 is A's)
             position 9 (B):   9 → 7 → 0       not 9 → 7 → 5 (5 is C's)
