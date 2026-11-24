@@ -223,6 +223,12 @@ def unpad_tree(inputs: dict[str, torch.Tensor]) -> dict[str, Any]:
 TREE_ATTENTION = "tree_fa3"
 
 
+def tree_attn_implementation(config) -> str:
+    """`sdpa` for models whose attention selects its own keys (Qwen4-Exp), tree attention otherwise."""
+    layer_types = getattr(config.get_text_config(), "layer_types", None) or []
+    return "sdpa" if "indexed_attention" in layer_types else TREE_ATTENTION
+
+
 # (the last row's `tree_cu_seqlens_q`, its maps): every layer asks for the maps of the same row, and building them
 # costs a host sync
 _MAPS = None
@@ -364,6 +370,51 @@ def tree_qsa_select_tokens(q, raw_keys, full_cos, full_sin, k_layernorm, block_t
     return selected[:, :n].contiguous().view(1, 1, n, n)
 
 
+_QWEN4_PATCHED = set()
+
+
+def patch_tree_qwen4_exp(model) -> bool:
+    """
+    Wrap Qwen4-Exp's `_shift_right_ignore_eos`, `_short_conv` and `_select_tokens`: given the tree of
+    [`~packing.TreeRow.pack`] in their kwargs they follow it, otherwise they run unchanged. Returns whether they exist.
+    """
+    # The modeling file; unlike type(model).__module__, also right when FSDP2 swaps the class
+    modeling = sys.modules[type(model).forward.__module__]
+    names = ("Qwen4ExpTextNGramEmbedding", "Qwen4ExpTextPLELayer", "Qwen4ExpTextQSAIndexer")
+    ngram, ple, indexer = (vars(modeling).get(name) for name in names)
+    if not all(
+        hasattr(cls, name)
+        for cls, name in ((ngram, "_shift_right_ignore_eos"), (ple, "_short_conv"), (indexer, "_select_tokens"))
+    ):
+        return False
+    if modeling in _QWEN4_PATCHED:
+        return True
+    shift_right, short_conv, select_tokens = ngram._shift_right_ignore_eos, ple._short_conv, indexer._select_tokens
+
+    def _shift_right_ignore_eos(self, token_ids, shift, **kwargs):
+        if "tree_segment_parents" not in kwargs:
+            return shift_right(self, token_ids, shift, **kwargs)
+        return tree_ngram_shift_right(token_ids, shift, self.eos_token_id, kwargs)
+
+    def _short_conv(self, hidden_states, cache, **kwargs):
+        if "tree_segment_parents" not in kwargs:
+            return short_conv(self, hidden_states, cache, **kwargs)
+        return tree_ple_short_conv(hidden_states.transpose(1, 2), self.conv1d, kwargs).transpose(1, 2)
+
+    def _select_tokens(self, hidden_states, q, raw_keys, full_cos, full_sin, attention_mask, **kwargs):
+        if "tree_segment_parents" not in kwargs:
+            return select_tokens(self, hidden_states, q, raw_keys, full_cos, full_sin, attention_mask, **kwargs)
+        return tree_qsa_select_tokens(
+            q, raw_keys, full_cos, full_sin, self.k_layernorm, self.block_topk, self.compress_ratio, kwargs
+        )
+
+    ngram._shift_right_ignore_eos = _shift_right_ignore_eos
+    ple._short_conv = _short_conv
+    indexer._select_tokens = _select_tokens
+    _QWEN4_PATCHED.add(modeling)
+    return True
+
+
 @cache
 def _flash_attn():
     from kernels import get_kernel
@@ -431,7 +482,8 @@ def patch_tree_gdn(model) -> bool:
     Returns:
         `bool`: whether the model's modeling module has those functions.
     """
-    modeling = sys.modules[type(model).__module__]
+    # The modeling file; unlike type(model).__module__, also right when FSDP2 swaps the class
+    modeling = sys.modules[type(model).forward.__module__]
     conv, chunk = vars(modeling).get("causal_conv1d_fn"), vars(modeling).get("torch_chunk_gated_delta_rule")
     if conv is None or chunk is None:
         return False
