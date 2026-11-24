@@ -1734,12 +1734,12 @@ class TestTreeQwen4Exp(TrlTestCase):
     """
 
     SAMPLES = [
-        _tree_sample([101, 102, 103, 201, 202], n_prompt=3),
-        _tree_sample([101, 102, 103, 201, 202, 401], n_prompt=3),
-        _tree_sample([101, 102, 103, 301, 302], n_prompt=3),
-        _tree_sample([500, 0, 501], n_prompt=1),  # a second root, with an EOS inside it
+        _tree_sample([101, 102, 103, 201, 202], n_prompt=3),  # sample A: prompt 101 102 103, answer 201 202
+        _tree_sample([101, 102, 103, 301, 302], n_prompt=3),  # sample B: same prompt, other answer
+        _tree_sample([101, 102, 103, 201, 202, 401], n_prompt=3),  # sample C: like A, then continues with 401
+        _tree_sample([500, 0, 501], n_prompt=1),  # sample D: unrelated, and 0 is EOS
     ]
-    PATHS = [[0, 1, 2, 3, 4], [0, 1, 2, 3, 5, 6], [0, 1, 7, 8, 9], [10, 11, 12]]  # each sample's row positions
+    PATHS = [[0, 1, 2, 3, 4], [0, 1, 7, 8, 9], [0, 1, 2, 3, 5, 6], [10, 11, 12]]  # each sample's row positions
 
     def test_prev_follows_each_sample(self):
         packed = _tree_row(self.SAMPLES).pack()
