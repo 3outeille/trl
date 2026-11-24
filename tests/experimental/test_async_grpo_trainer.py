@@ -1751,30 +1751,51 @@ class TestTreeQwen4Exp(TrlTestCase):
             assert prev[path].tolist() == [-1] + path[:-1]
 
     def test_ngram_shift_matches_each_sample_alone(self):
+        """
+        Each token is replaced by the token `shift` steps back on its own sample, or by EOS (0) before the start of the
+        sample or past an EOS:
+
+            position  0    1    2    3    4    5    6    7    8    9    10   11   12
+            token     101  102  103  201  202  202  401  103  301  302  500  0    501
+            shift 1   0    101  102  103  201  201  202  102  103  301  0    500  0
+            shift 2   0    0    101  102  103  103  201  101  102  103  0    0    0
+
+        Along the row instead, position 5 would read 202 and position 7 would read 401 with shift 1, and position 12
+        would read 500 with shift 2.
+        """
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
         model_shift = modeling.Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos
         layer = SimpleNamespace(eos_token_id=0)  # the model's shift only reads `eos_token_id` from its layer
         packed = _tree_row(self.SAMPLES).pack()
         row = packed["input_ids"].unsqueeze(0)
 
-        for shift in (1, 2):  # with 2, the shift from 501 must stop at the EOS instead of reaching 500
+        for shift in (1, 2):
             shifted = tree_ngram_shift_right(row, shift, 0, _tree_kwargs(packed))
 
             for path in self.PATHS:
                 assert shifted[:, path].tolist() == model_shift(layer, row[:, path], shift).tolist()
 
     def test_short_conv_matches_each_sample_alone(self):
+        """
+        With 3 taps and dilation 2, each position reads itself and the positions 2 and 4 steps back on its own sample,
+        and zeros before the start of the sample (-):
+
+            position  0  1  2  3  4  5  6  7  8  9  10  11  12
+            2 back    -  -  0  1  2  2  3  0  1  7  -   -   10
+            4 back    -  -  -  -  0  0  1  -  -  0  -   -   -
+
+        Along the row instead, position 6 would read 4 and 2, and position 9 would read 7 and 5.
+        """
         packed = _tree_row(self.SAMPLES).pack()
         torch.manual_seed(0)
-        # Depthwise and dilated like the model's: each position reads itself, 3 and 6 steps back
-        conv1d = torch.nn.Conv1d(4, 4, kernel_size=3, dilation=3, groups=4)
+        conv1d = torch.nn.Conv1d(4, 4, kernel_size=3, dilation=2, groups=4)  # depthwise and dilated, like the model's
         hidden_states = torch.randn(1, 4, len(packed["input_ids"]))
 
         output = tree_ple_short_conv(hidden_states, conv1d, _tree_kwargs(packed))
 
         for path in self.PATHS:
             # The model pads one sequence on the left with (kernel_size - 1) * dilation zeros
-            alone = torch.nn.functional.silu(conv1d(torch.nn.functional.pad(hidden_states[..., path], (6, 0))))
+            alone = torch.nn.functional.silu(conv1d(torch.nn.functional.pad(hidden_states[..., path], (4, 0))))
             torch.testing.assert_close(output[..., path], alone)
 
 
