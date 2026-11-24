@@ -248,14 +248,13 @@ def tree_maps(tree):
     prev = torch.arange(int(ends[-1]), device=starts.device) - 1  # inside a segment: the position to the left
     prev[starts] = torch.where(parents >= 0, ends[parents] - 1, -1)  # at a segment start: the parent's last position
 
-    # `tree_kv_index` lists each segment's path, in ascending row positions, and the segment ends that path
+    # Each segment's path (its earlier segments, then itself) in ascending row positions: a position sees the
+    # positions of its segment's path up to itself
     visible = torch.zeros(len(prev), len(prev), dtype=torch.bool, device=prev.device)
-    path_bounds = tree["tree_cu_seqlens_k"].tolist()
-    for start, end, path_start, path_end in zip(
-        starts.tolist(), ends.tolist(), path_bounds[:-1], path_bounds[1:], strict=True
-    ):
-        path = tree["tree_kv_index"][path_start:path_end].long()
-        visible[start:end, path] = path.unsqueeze(0) <= torch.arange(start, end, device=prev.device).unsqueeze(1)
+    paths = tree["tree_kv_index"].long().split(tree["tree_cu_seqlens_k"].diff().tolist())
+    for start, end, path in zip(starts.tolist(), ends.tolist(), paths, strict=True):
+        positions = torch.arange(start, end, device=prev.device)
+        visible[start:end, path] = path <= positions[:, None]
     depth = visible.sum(dim=1) - 1  # a position sees itself and the `depth` positions before it on its path
 
     _MAPS = (tree["tree_cu_seqlens_q"], {"prev": prev, "visible": visible, "depth": depth})
