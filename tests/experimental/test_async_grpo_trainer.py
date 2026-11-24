@@ -1806,17 +1806,19 @@ class TestTreeQwen4Exp(TrlTestCase):
     @pytest.mark.parametrize(("block_topk", "compress_ratio"), [(1, 2), (2, 4), (1, 8)])  # 8: no full block at all
     def test_sparse_selection_matches_each_sample_alone(self, block_topk, compress_ratio):
         """
-        The selection runs once on the whole row and gives a table: may query i attend to token j? Each sample's rows
-        and columns must equal the model's table for that sample alone, and its rows must pick nothing outside it.
+        QSA lets each token (the query) attend to a few earlier tokens of its own sample only. It cuts the sample into
+        blocks of `compress_ratio` tokens, keeps the `block_topk` blocks that score best against the query, and always
+        keeps the tokens after the last full block.
 
-        Each query keeps its `block_topk` best blocks of `compress_ratio` tokens in its own sample, plus the tokens after
-        its last full block. With `compress_ratio=2` and the row of the class docstring, the last token of each sample
-        chooses among:
+        Example with `compress_ratio=2`, `block_topk=1`, and the query at position 9 (B's 302):
 
-            A:  (0 1)  (2 3)  + 4
-            B:  (0 1)  (7 8)  + 9
-            C:  (0 1)  (2 3)  (5 6)
-            D:  (10 11)       + 12
+            B's positions:  0 1 | 7 8 | 9
+            blocks:         (0 1)  (7 8)    tail: 9
+            picked:         the better of (0 1) and (7 8), plus 9
+
+        The tree version runs once on the whole row and gives a 13 x 13 yes/no table: row = query, column = token. For
+        each sample, the table at its positions must equal the model's table for that sample run alone, and its rows
+        must say no everywhere else.
         """
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
         packed = _tree_row(self.SAMPLES).pack()
