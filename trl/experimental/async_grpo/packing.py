@@ -223,9 +223,7 @@ def unpad_tree(inputs: dict[str, torch.Tensor]) -> dict[str, Any]:
 TREE_ATTENTION = "tree_fa3"
 
 
-# (the last row's `tree_cu_seqlens_q`, its maps): every layer asks for the maps of the same row, and building them
-# costs a host sync
-_MAPS = None
+_MAPS = None  # (the last row's `tree_cu_seqlens_q`, its maps): all layers of a forward share one row
 
 
 def tree_maps(tree):
@@ -256,10 +254,8 @@ def _step_back(prev: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
 
 def tree_ngram_shift_right(token_ids: torch.Tensor, shift: int, eos_token_id: int, tree) -> torch.Tensor:
     """
-    The token `shift` steps back on each position's own path, or EOS where the walk passes the start of the path or
-    meets an EOS: the model's `_shift_right_ignore_eos`, along paths instead of along the row.
-
-    `token_ids` is `(batch, context + n)`: the model puts `context` EOS columns before the row's `n` tokens.
+    The model's `_shift_right_ignore_eos` along paths: the token `shift` steps back on each position's own path, or
+    EOS where the walk passes the path's start or an EOS. `token_ids` is `(batch, context EOS columns + n)`.
     """
     if shift == 0:
         return token_ids
@@ -282,11 +278,8 @@ def tree_ngram_shift_right(token_ids: torch.Tensor, shift: int, eos_token_id: in
 
 def tree_ple_short_conv(hidden_states: torch.Tensor, conv1d: torch.nn.Conv1d, tree) -> torch.Tensor:
     """
-    `silu(conv1d(hidden_states))` for the model's dilated depthwise `conv1d`, along paths instead of along the row.
-
-    With 3 taps and dilation 3, a position reads itself, the position 3 steps back on its path and the one 6 steps
-    back. A step past the start of the path reads zeros, as the left padding does for one plain sequence.
-    `hidden_states` is `(batch, channels, n)`.
+    `silu(conv1d(hidden_states))` along paths: with 3 taps and dilation 3, a position reads itself and the positions 3
+    and 6 steps back on its path, or zeros past its start. `hidden_states` is `(batch, channels, n)`.
     """
     prev = tree_maps(tree)["prev"]
     weight = conv1d.weight[:, 0, :]  # (channels, taps): depthwise, so one filter per channel
