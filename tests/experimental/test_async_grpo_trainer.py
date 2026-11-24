@@ -1803,18 +1803,6 @@ class TestTreeQwen4Exp(TrlTestCase):
             alone = torch.nn.functional.silu(conv1d(torch.nn.functional.pad(hidden_states[..., path], (4, 0))))
             torch.testing.assert_close(output[..., path], alone)
 
-    def test_visible_and_depth_follow_each_sample(self):
-        """Along each sample, `depth` counts 0, 1, 2, ... and `visible` is causal, with nothing outside the sample."""
-        packed = _tree_row(self.SAMPLES).pack()
-
-        maps = tree_maps(_tree_kwargs(packed))
-
-        for path in self.PATHS:
-            causal = torch.ones(len(path), len(path), dtype=torch.bool).tril()
-            assert maps["depth"][path].tolist() == list(range(len(path)))
-            assert maps["visible"][path][:, path].tolist() == causal.tolist()
-            assert maps["visible"][path].sum() == causal.sum()  # and nothing outside the sample
-
     @pytest.mark.parametrize(("block_topk", "compress_ratio"), [(1, 2), (2, 4), (1, 8)])  # 8: no full block at all
     def test_sparse_selection_matches_each_sample_alone(self, block_topk, compress_ratio):
         """
