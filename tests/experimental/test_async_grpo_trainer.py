@@ -1806,6 +1806,9 @@ class TestTreeQwen4Exp(TrlTestCase):
     @pytest.mark.parametrize(("block_topk", "compress_ratio"), [(1, 2), (2, 4), (1, 8)])  # 8: no full block at all
     def test_sparse_selection_matches_each_sample_alone(self, block_topk, compress_ratio):
         """
+        The selection runs once on the whole row and gives a table: may query i attend to token j? Each sample's rows
+        and columns must equal the model's table for that sample alone, and its rows must pick nothing outside it.
+
         Each query keeps its `block_topk` best blocks of `compress_ratio` tokens in its own sample, plus the tokens after
         its last full block. With `compress_ratio=2` and the row of the class docstring, the last token of each sample
         chooses among:
@@ -1814,37 +1817,37 @@ class TestTreeQwen4Exp(TrlTestCase):
             B:  (0 1)  (7 8)  + 9
             C:  (0 1)  (2 3)  (5 6)
             D:  (10 11)       + 12
-
-        Block (0 1) is in A, B and C, so it is pooled and scored once.
         """
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
-        model_select = modeling.Qwen4ExpTextQSAIndexer._select_tokens
         packed = _tree_row(self.SAMPLES).pack()
-        n, heads, head_dim = len(packed["input_ids"]), 2, 8
+        n = len(packed["input_ids"])
         torch.manual_seed(0)
-        q, raw_keys = torch.randn(1, n, heads, head_dim), torch.randn(1, n, head_dim)
-        cos, sin = torch.randn(2, 1, n, head_dim)  # any values: both sides read the same ones per position
-        norm = torch.nn.RMSNorm(head_dim)
-        indexer = SimpleNamespace(  # the model's selection only reads these from its layer
-            k_layernorm=norm,
-            block_topk=block_topk,
-            compress_ratio=compress_ratio,
-            token_budget=block_topk * compress_ratio,
-            index_head_dim=head_dim,
-        )
+        q, keys = torch.randn(1, n, 2, 8), torch.randn(1, n, 8)  # one query (2 heads) and one key per position
+        cos, sin = torch.randn(2, 1, n, 8)  # any values: both sides read the same ones per position
+        norm = torch.nn.RMSNorm(8)
 
-        selected = tree_qsa_select_tokens(
-            q, raw_keys, cos, sin, norm, block_topk, compress_ratio, _tree_kwargs(packed)
-        )
+        def alone(path):
+            """The model's table for one sample run alone."""
+            layer = SimpleNamespace(  # all the model's selection reads from its layer
+                k_layernorm=norm,
+                block_topk=block_topk,
+                compress_ratio=compress_ratio,
+                token_budget=block_topk * compress_ratio,
+                index_head_dim=8,
+            )
+            causal = torch.ones(len(path), len(path), dtype=torch.bool).tril()[None, None]  # a sample sees its past
+            hidden_states = torch.empty(1, len(path), 1)  # only its shape is read
+            table = modeling.Qwen4ExpTextQSAIndexer._select_tokens(
+                layer, hidden_states, q[:, path], keys[:, path], cos[:, path], sin[:, path], causal
+            )
+            return table[0, 0]
+
+        table = tree_qsa_select_tokens(q, keys, cos, sin, norm, block_topk, compress_ratio, _tree_kwargs(packed))[0, 0]
 
         for path in self.PATHS:
-            causal = torch.ones(len(path), len(path), dtype=torch.bool).tril()[None, None]
-            hidden_states = torch.empty(1, len(path), 1)  # the model only reads its shape
-            alone = model_select(
-                indexer, hidden_states, q[:, path], raw_keys[:, path], cos[:, path], sin[:, path], causal
-            )
-            assert selected[0, 0][path][:, path].tolist() == alone[0, 0].tolist()
-            assert selected[0, 0][path].sum() == alone.sum()  # and nothing outside the sample
+            rows = table[path]  # the sample's queries, against all n tokens
+            assert rows[:, path].tolist() == alone(path).tolist()  # same picks inside the sample
+            assert rows.sum() == rows[:, path].sum()  # nothing picked outside the sample
 
 
 def _finalize(turns, rollout_id="r0"):
