@@ -1760,8 +1760,9 @@ class TestTreeQwen4Exp(TrlTestCase):
             shift 1   0    101  102  103  201  201  202  102  103  301  0    500  0
             shift 2   0    0    101  102  103  103  201  101  102  103  0    0    0
 
-        Along the row instead, position 5 would read 202 and position 7 would read 401 with shift 1, and position 12
-        would read 500 with shift 2.
+        With shift 1, position 5 (sample C's 202) gets 201, the token before it in sample C. The token just before it in
+        the row is sample A's 202, which is not in sample C. Likewise position 7 (sample B's 103) gets 102, not sample
+        C's 401. With shift 2, position 12 gets EOS: going from 501 back to 500 crosses the EOS at position 11.
         """
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
         model_shift = modeling.Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos
@@ -1784,7 +1785,8 @@ class TestTreeQwen4Exp(TrlTestCase):
             2 back    -  -  0  1  2  2  3  0  1  7  -   -   10
             4 back    -  -  -  -  0  0  1  -  -  0  -   -   -
 
-        Along the row instead, position 6 would read 4 and 2, and position 9 would read 7 and 5.
+        Position 6 (sample C's 401) reads positions 3 and 1. A convolution over the plain row would read positions 4 and
+        2 instead, and position 4 is sample A's 202.
         """
         packed = _tree_row(self.SAMPLES).pack()
         torch.manual_seed(0)
