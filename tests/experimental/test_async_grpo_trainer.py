@@ -1722,67 +1722,60 @@ def _tree_kwargs(packed):
     return {key: value for key, value in packed.items() if key.startswith("tree_")}
 
 
-def _segments(packed):
-    """Every segment of a packed row: its row positions, and the row positions of its path, which it ends."""
-    cu_seqlens_q, cu_seqlens_k = packed["tree_cu_seqlens_q"].tolist(), packed["tree_cu_seqlens_k"].tolist()
-    for q_start, q_end, k_start, k_end in zip(
-        cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_k[:-1], cu_seqlens_k[1:], strict=True
-    ):
-        yield q_start, q_end, packed["tree_kv_index"][k_start:k_end].tolist()
-
-
 class TestTreeQwen4Exp(TrlTestCase):
-    """On a tree-packed row, every step must give each position what its own sample gives alone."""
+    """
+    On a tree-packed row, the n-gram shift and the short convolution must give every token what it gets when its sample
+    runs alone. The four samples below pack into one row (0 is EOS):
 
-    ROWS = [
+        position  0    1    2    3    4    5    6    7    8    9    10   11   12
+        token     101  102  103  201  202  202  401  103  301  302  500  0    501
+
+    A token is shared only if the next token is shared too, so 103 and 202 appear twice.
+    """
+
+    SAMPLES = [
         _tree_sample([101, 102, 103, 201, 202], n_prompt=3),
-        _tree_sample([101, 102, 103, 301, 302], n_prompt=3),
         _tree_sample([101, 102, 103, 201, 202, 401], n_prompt=3),
-        _tree_sample([500, 0, 501], n_prompt=1),  # a second root, with EOS (0) inside it so the shift has to stop
+        _tree_sample([101, 102, 103, 301, 302], n_prompt=3),
+        _tree_sample([500, 0, 501], n_prompt=1),  # a second root, with an EOS inside it
     ]
+    PATHS = [[0, 1, 2, 3, 4], [0, 1, 2, 3, 5, 6], [0, 1, 7, 8, 9], [10, 11, 12]]  # each sample's row positions
 
-    def test_maps_of_a_row_with_two_roots_and_a_fork(self):
-        packed = _tree_row(self.ROWS).pack()
+    def test_prev_follows_each_sample(self):
+        packed = _tree_row(self.SAMPLES).pack()
 
-        maps = tree_maps(_tree_kwargs(packed))
+        prev = tree_maps(_tree_kwargs(packed))["prev"]
 
-        # Two samples share a token only if they also share the next one, so 103 and 202 appear twice. The paths are
-        # 0 1 2 3 4, 0 1 2 3 5 6, 0 1 7 8 9 and 10 11 12.
         assert packed["input_ids"].tolist() == [101, 102, 103, 201, 202, 202, 401, 103, 301, 302, 500, 0, 501]
-        assert maps["prev"].tolist() == [-1, 0, 1, 2, 3, 3, 5, 1, 7, 8, -1, 10, 11]
+        for path in self.PATHS:
+            assert prev[path].tolist() == [-1] + path[:-1]
 
-    def test_ngram_shift_matches_each_path_alone(self):
+    def test_ngram_shift_matches_each_sample_alone(self):
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
         model_shift = modeling.Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos
-        eos, context = 0, [0, 0]  # the model puts EOS context columns before the tokens
-        embedding = SimpleNamespace(eos_token_id=eos)  # all the model's shift reads from its layer
-        packed = _tree_row(self.ROWS).pack()
-        tokens = packed["input_ids"].tolist()
+        layer = SimpleNamespace(eos_token_id=0)  # the model's shift only reads `eos_token_id` from its layer
+        packed = _tree_row(self.SAMPLES).pack()
+        row = packed["input_ids"].unsqueeze(0)
 
-        for shift in (1, 2):
-            shifted = tree_ngram_shift_right(torch.tensor([context + tokens]), shift, eos, _tree_kwargs(packed))[0]
+        for shift in (1, 2):  # with 2, the shift from 501 must stop at the EOS instead of reaching 500
+            shifted = tree_ngram_shift_right(row, shift, 0, _tree_kwargs(packed))
 
-            assert shifted[: len(context)].tolist() == context
-            for start, end, path in _segments(packed):
-                alone = model_shift(embedding, torch.tensor([context + [tokens[p] for p in path]]), shift)[0]
-                assert shifted[len(context) + start : len(context) + end].tolist() == alone[-(end - start) :].tolist()
+            for path in self.PATHS:
+                assert shifted[:, path].tolist() == model_shift(layer, row[:, path], shift).tolist()
 
-    def test_short_conv_matches_each_path_alone(self):
-        packed = _tree_row(self.ROWS).pack()
-        n, channels, taps, dilation = len(packed["input_ids"]), 4, 3, 3
-        left_padding = (taps - 1) * dilation  # what the model pads one plain sequence with
+    def test_short_conv_matches_each_sample_alone(self):
+        packed = _tree_row(self.SAMPLES).pack()
         torch.manual_seed(0)
-        conv1d = torch.nn.Conv1d(channels, channels, kernel_size=taps, groups=channels, dilation=dilation, bias=True)
-        hidden_states = torch.randn(1, channels, n)
+        # Depthwise and dilated like the model's: each position reads itself, 3 and 6 steps back
+        conv1d = torch.nn.Conv1d(4, 4, kernel_size=3, dilation=3, groups=4)
+        hidden_states = torch.randn(1, 4, len(packed["input_ids"]))
 
         output = tree_ple_short_conv(hidden_states, conv1d, _tree_kwargs(packed))
 
-        assert output.shape == hidden_states.shape
-        for start, end, path in _segments(packed):
-            alone = torch.nn.functional.silu(
-                conv1d(torch.nn.functional.pad(hidden_states[..., path], (left_padding, 0)))
-            )
-            torch.testing.assert_close(output[..., start:end], alone[..., -(end - start) :])
+        for path in self.PATHS:
+            # The model pads one sequence on the left with (kernel_size - 1) * dilation zeros
+            alone = torch.nn.functional.silu(conv1d(torch.nn.functional.pad(hidden_states[..., path], (6, 0))))
+            torch.testing.assert_close(output[..., path], alone)
 
 
 def _finalize(turns, rollout_id="r0"):
