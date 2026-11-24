@@ -68,7 +68,13 @@ from trl.experimental.async_grpo.async_rollout_worker import (
     _common_prefix_len,
     _spawn_stop_watcher,
 )
-from trl.experimental.async_grpo.packing import TREE_ATTENTION, TreeRow
+from trl.experimental.async_grpo.packing import (
+    TREE_ATTENTION,
+    TreeRow,
+    tree_maps,
+    tree_ngram_shift_right,
+    tree_ple_short_conv,
+)
 from trl.experimental.async_grpo.weight_transfer import WeightTransferClient
 from trl.trainer.base_trainer import _BaseTrainer
 
@@ -1709,6 +1715,74 @@ class TestTreePackingRefusesUnsupportedModels(TrlTestCase):
                 args=AsyncGRPOConfig(output_dir=self.tmp_dir, report_to="none"),
                 train_dataset=dataset,
             )
+
+
+def _tree_kwargs(packed):
+    """The `tree_*` tensors of a packed row, as the model receives them."""
+    return {key: value for key, value in packed.items() if key.startswith("tree_")}
+
+
+def _segments(packed):
+    """Every segment of a packed row: its row positions, and the row positions of its path, which it ends."""
+    cu_seqlens_q, cu_seqlens_k = packed["tree_cu_seqlens_q"].tolist(), packed["tree_cu_seqlens_k"].tolist()
+    for q_start, q_end, k_start, k_end in zip(
+        cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_k[:-1], cu_seqlens_k[1:], strict=True
+    ):
+        yield q_start, q_end, packed["tree_kv_index"][k_start:k_end].tolist()
+
+
+class TestTreeQwen4Exp(TrlTestCase):
+    """On a tree-packed row, every step must give each position what its own sample gives alone."""
+
+    ROWS = [
+        _tree_sample([101, 102, 103, 201, 202], n_prompt=3),
+        _tree_sample([101, 102, 103, 301, 302], n_prompt=3),
+        _tree_sample([101, 102, 103, 201, 202, 401], n_prompt=3),
+        _tree_sample([500, 0, 501], n_prompt=1),  # a second root, with EOS (0) inside it so the shift has to stop
+    ]
+
+    def test_maps_of_a_row_with_two_roots_and_a_fork(self):
+        packed = _tree_row(self.ROWS).pack()
+
+        maps = tree_maps(_tree_kwargs(packed))
+
+        # Two samples share a token only if they also share the next one, so 103 and 202 appear twice. The paths are
+        # 0 1 2 3 4, 0 1 2 3 5 6, 0 1 7 8 9 and 10 11 12.
+        assert packed["input_ids"].tolist() == [101, 102, 103, 201, 202, 202, 401, 103, 301, 302, 500, 0, 501]
+        assert maps["prev"].tolist() == [-1, 0, 1, 2, 3, 3, 5, 1, 7, 8, -1, 10, 11]
+
+    def test_ngram_shift_matches_each_path_alone(self):
+        modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        model_shift = modeling.Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos
+        eos, context = 0, [0, 0]  # the model puts EOS context columns before the tokens
+        embedding = SimpleNamespace(eos_token_id=eos)  # all the model's shift reads from its layer
+        packed = _tree_row(self.ROWS).pack()
+        tokens = packed["input_ids"].tolist()
+
+        for shift in (1, 2):
+            shifted = tree_ngram_shift_right(torch.tensor([context + tokens]), shift, eos, _tree_kwargs(packed))[0]
+
+            assert shifted[: len(context)].tolist() == context
+            for start, end, path in _segments(packed):
+                alone = model_shift(embedding, torch.tensor([context + [tokens[p] for p in path]]), shift)[0]
+                assert shifted[len(context) + start : len(context) + end].tolist() == alone[-(end - start) :].tolist()
+
+    def test_short_conv_matches_each_path_alone(self):
+        packed = _tree_row(self.ROWS).pack()
+        n, channels, taps, dilation = len(packed["input_ids"]), 4, 3, 3
+        left_padding = (taps - 1) * dilation  # what the model pads one plain sequence with
+        torch.manual_seed(0)
+        conv1d = torch.nn.Conv1d(channels, channels, kernel_size=taps, groups=channels, dilation=dilation, bias=True)
+        hidden_states = torch.randn(1, channels, n)
+
+        output = tree_ple_short_conv(hidden_states, conv1d, _tree_kwargs(packed))
+
+        assert output.shape == hidden_states.shape
+        for start, end, path in _segments(packed):
+            alone = torch.nn.functional.silu(
+                conv1d(torch.nn.functional.pad(hidden_states[..., path], (left_padding, 0)))
+            )
+            torch.testing.assert_close(output[..., start:end], alone[..., -(end - start) :])
 
 
 def _finalize(turns, rollout_id="r0"):
