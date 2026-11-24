@@ -1812,9 +1812,11 @@ class TestTreeQwen4Exp(TrlTestCase):
 
         Example with `compress_ratio=2`, `block_topk=1`, and the query at position 9 (B's 302):
 
-            B's positions:  0 1 | 7 8 | 9
-            blocks:         (0 1)  (7 8)    tail: 9
-            picked:         the better of (0 1) and (7 8), plus 9
+            B's positions:            0 1 | 7 8 | 9
+            blocks:                   (0 1)  (7 8)    tail: 9
+            is allowed to attend to:  the block that scores higher, (0 1) or (7 8), and the tail 9
+
+        In the table below, row 9 says yes at 0 1 9 or at 7 8 9, and no everywhere else.
 
         The tree version runs once on the whole row and gives a 13 x 13 yes/no table: row = query, column = token. For
         each sample, the table at its positions must equal the model's table for that sample run alone, and its rows
