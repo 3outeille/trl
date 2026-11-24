@@ -74,6 +74,7 @@ from trl.experimental.async_grpo.packing import (
     tree_maps,
     tree_ngram_shift_right,
     tree_ple_short_conv,
+    tree_qsa_select_tokens,
 )
 from trl.experimental.async_grpo.weight_transfer import WeightTransferClient
 from trl.trainer.base_trainer import _BaseTrainer
@@ -1725,7 +1726,8 @@ def _tree_kwargs(packed):
 class TestTreeQwen4Exp(TrlTestCase):
     """
     Tree packing stores the tokens that samples share once, then each sample continues on its own branch. The n-gram
-    shift and the short conv must read earlier tokens along that branch, as if the sample ran alone.
+    shift, the short conv and the QSA token selection must read earlier tokens along that branch, as if the sample ran
+    alone.
 
     The four samples (0 is EOS) form this tree:
 
@@ -1800,6 +1802,48 @@ class TestTreeQwen4Exp(TrlTestCase):
             # The model pads one sequence on the left with (kernel_size - 1) * dilation zeros
             alone = torch.nn.functional.silu(conv1d(torch.nn.functional.pad(hidden_states[..., path], (4, 0))))
             torch.testing.assert_close(output[..., path], alone)
+
+    def test_visible_and_depth_follow_each_sample(self):
+        packed = _tree_row(self.SAMPLES).pack()
+
+        maps = tree_maps(_tree_kwargs(packed))
+
+        assert maps["depth"].tolist() == packed["position_ids"].tolist()
+        for path in self.PATHS:
+            causal = torch.ones(len(path), len(path), dtype=torch.bool).tril()
+            assert maps["visible"][path][:, path].tolist() == causal.tolist()
+            assert maps["visible"][path].sum() == causal.sum()  # and nothing outside the sample
+
+    @pytest.mark.parametrize(("block_topk", "compress_ratio"), [(1, 2), (2, 4), (1, 8)])  # 8: no full block at all
+    def test_sparse_selection_matches_each_sample_alone(self, block_topk, compress_ratio):
+        modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+        model_select = modeling.Qwen4ExpTextQSAIndexer._select_tokens
+        packed = _tree_row(self.SAMPLES).pack()
+        n, heads, head_dim = len(packed["input_ids"]), 2, 8
+        torch.manual_seed(0)
+        q, raw_keys = torch.randn(1, n, heads, head_dim), torch.randn(1, n, head_dim)
+        angles = torch.randn(1, n, head_dim)  # any rotary angles do: both sides read the same ones per position
+        cos, sin, norm = angles.cos(), angles.sin(), torch.nn.RMSNorm(head_dim)
+        indexer = SimpleNamespace(  # the model's selection only reads these from its layer
+            k_layernorm=norm,
+            block_topk=block_topk,
+            compress_ratio=compress_ratio,
+            token_budget=block_topk * compress_ratio,
+            index_head_dim=head_dim,
+        )
+
+        selected = tree_qsa_select_tokens(
+            q, raw_keys, cos, sin, norm, block_topk, compress_ratio, _tree_kwargs(packed)
+        )
+
+        for path in self.PATHS:
+            causal = torch.ones(len(path), len(path), dtype=torch.bool).tril()[None, None]
+            hidden_states = torch.empty(1, len(path), 1)  # the model only reads its shape
+            alone = model_select(
+                indexer, hidden_states, q[:, path], raw_keys[:, path], cos[:, path], sin[:, path], causal
+            )
+            assert selected[0, 0][path][:, path].tolist() == alone[0, 0].tolist()
+            assert selected[0, 0][path].sum() == alone.sum()  # and nothing outside the sample
 
 
 def _finalize(turns, rollout_id="r0"):
