@@ -1724,20 +1724,22 @@ def _tree_kwargs(packed):
 
 class TestTreeQwen4Exp(TrlTestCase):
     """
-    AsyncGRPO packs several samples into one row as a tree: the tokens that samples have in common at the start are
-    stored once, and each sample continues on its own branch. The n-gram shift and the short convolution read earlier
-    tokens, so on such a row they must read the earlier tokens of the token's own sample, not its neighbours in the row.
-    These tests check that every token gets what it gets when its sample runs alone.
+    Tree packing stores the tokens that samples share once, then each sample continues on its own branch. The n-gram
+    shift and the short conv must read earlier tokens along that branch, as if the sample ran alone.
 
-    The four samples below (0 is EOS) pack into this row:
+    The four samples (0 is EOS) form this tree:
+
+        101 → 102 ┬→ 103 → 201 ┬→ 202            A
+                  │            └→ 202 → 401      C
+                  └→ 103 → 301 → 302             B
+        500 → 0 → 501                            D
+
+    laid out as one row:
 
         position  0    1    2    3    4    5    6    7    8    9    10   11   12
         token     101  102  103  201  202  202  401  103  301  302  500  0    501
-        sample    ABC  ABC  AC   AC   A    C    C    B    B    B    D    D    D
 
-    Each position's output predicts the next token, so samples share a position only if they also have the same next
-    token. That is why 103 appears twice (next is 201 in A and C, 301 in B), and 202 too (A ends there, C continues
-    with 401). `PATHS` lists each sample's positions in order.
+    A position predicts the next token, so it is shared only if the next token is too: 103 and 202 appear twice.
     """
 
     SAMPLES = [
@@ -1759,17 +1761,16 @@ class TestTreeQwen4Exp(TrlTestCase):
 
     def test_ngram_shift_matches_each_sample_alone(self):
         """
-        Each token is replaced by the token `shift` steps back on its own sample, or by EOS (0) before the start of the
-        sample or past an EOS:
+        Each token becomes the token `shift` steps back in its own sample, or EOS (0) at the start or past an EOS:
 
             position  0    1    2    3    4    5    6    7    8    9    10   11   12
             token     101  102  103  201  202  202  401  103  301  302  500  0    501
             shift 1   0    101  102  103  201  201  202  102  103  301  0    500  0
             shift 2   0    0    101  102  103  103  201  101  102  103  0    0    0
 
-        With shift 1, position 5 (sample C's 202) gets 201, the token before it in sample C. The token just before it in
-        the row is sample A's 202, which is not in sample C. Likewise position 7 (sample B's 103) gets 102, not sample
-        C's 401. With shift 2, position 12 gets EOS: going from 501 back to 500 crosses the EOS at position 11.
+            shift 1, position 5 (C):   5 → 3 = 201     not 4 = 202 (A)
+            shift 1, position 7 (B):   7 → 1 = 102     not 6 = 401 (C)
+            shift 2, position 12 (D):  12 → 11 = EOS, so 0
         """
         modeling = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
         model_shift = modeling.Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos
@@ -1785,15 +1786,12 @@ class TestTreeQwen4Exp(TrlTestCase):
 
     def test_short_conv_matches_each_sample_alone(self):
         """
-        With 3 taps and dilation 2, each position reads itself and the positions 2 and 4 steps back on its own sample,
-        and zeros before the start of the sample (-):
+        With 3 taps and dilation 2, each position reads itself and the positions 2 and 4 steps back in its own sample,
+        or zeros before the start of the sample:
 
-            position  0  1  2  3  4  5  6  7  8  9  10  11  12
-            2 back    -  -  0  1  2  2  3  0  1  7  -   -   10
-            4 back    -  -  -  -  0  0  1  -  -  0  -   -   -
-
-        Position 6 (sample C's 401) reads positions 3 and 1. A convolution over the plain row would read positions 4 and
-        2 instead, and position 4 is sample A's 202.
+            position 6 (C):   6 → 3 → 1       not 6 → 4 → 2 (4 is A's)
+            position 9 (B):   9 → 7 → 0       not 9 → 7 → 5 (5 is C's)
+            position 12 (D):  12 → 10 → zero  (D starts at 10)
         """
         packed = _tree_row(self.SAMPLES).pack()
         torch.manual_seed(0)
